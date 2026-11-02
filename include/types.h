@@ -965,6 +965,8 @@ typedef enum parser_rc
   PARSER_PKZIP_MEMBER_TOO_SHORT   = -52,
   PARSER_ZLIB_UNAVAILABLE         = -53,
 
+  PARSER_SEVEN_ZIP_METHOD_UNSUPPORTED = -54,
+
   PARSER_HAVE_ERRNO           = -100,
   PARSER_UNKNOWN_ERROR        = -255
 
@@ -1479,6 +1481,16 @@ typedef struct hashes
   bool         radix_deduped;
   bool         radix_digests_reordered;
 
+  // the salts still to crack and what hashconfig->combined_len_max leaves for the password beside
+  // them, filled when the module sets that limit
+
+  u32          combined_salts_cnt;
+  u32          combined_salts_short;
+  u32          combined_salt_len_min;
+  u32          combined_salt_len_max;
+  u32          combined_pw_len_min;
+  u32          combined_pw_len_max;
+
 } hashes_t;
 
 typedef struct hashconfig
@@ -1520,6 +1532,10 @@ typedef struct hashconfig
 
   u32   salt_min;
   u32   salt_max;
+
+  // what password and salt may take together, where a kernel keeps both in one buffer, or 0
+
+  u32   combined_len_max;
 
   // hash count limit
 
@@ -3176,6 +3192,13 @@ typedef struct bitmap_ctx
 
 } bitmap_ctx_t;
 
+typedef struct folder_request
+{
+  bool  given;
+  char *profile_folder;
+
+} folder_request_t;
+
 typedef struct folder_config
 {
   char *cwd;
@@ -3185,6 +3208,11 @@ typedef struct folder_config
   char *session_dir;
   char *shared_dir;
   char *cpath_real;
+
+  // What a program asked for with hashcat_session_init_folders (). folder_config_destroy () keeps it,
+  // because a restore into another working directory sets the folders above up a second time.
+
+  folder_request_t request;
 
 } folder_config_t;
 
@@ -4382,6 +4410,10 @@ typedef struct module_ctx
   const char *(*module_st_pass)                 (const hashconfig_t *, const user_options_t *, const user_options_extra_t *);
   u64         (*module_tmp_size)                (const hashconfig_t *, const user_options_t *, const user_options_extra_t *);
   bool        (*module_warmup_disable)          (const hashconfig_t *, const user_options_t *, const user_options_extra_t *);
+
+  u32         (*module_combined_len_max)        (const hashconfig_t *, const user_options_t *, const user_options_extra_t *);
+  u32         (*module_combined_len_pw)         (const hashconfig_t *, const user_options_t *, const user_options_extra_t *, const u32);
+  u32         (*module_combined_len_salt)       (const hashconfig_t *, const user_options_t *, const user_options_extra_t *, const salt_t *, const void *);
 
   int         (*module_hash_binary_count)       (const hashes_t *);
   int         (*module_hash_binary_parse)       (const hashconfig_t *, const user_options_t *, const user_options_extra_t *, hashes_t *);
