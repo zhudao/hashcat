@@ -61,21 +61,21 @@ typedef struct krb5asrep_3
 
 } krb5asrep_3_t;
 
-u64 module_esalt_size (MAYBE_UNUSED const hashconfig_t *hashconfig, MAYBE_UNUSED const user_options_t *user_options, MAYBE_UNUSED const user_options_extra_t *user_options_extra)
+static u64 module_esalt_size (MAYBE_UNUSED const hashconfig_t *hashconfig, MAYBE_UNUSED const user_options_t *user_options, MAYBE_UNUSED const user_options_extra_t *user_options_extra)
 {
   const u64 esalt_size = (const u64) sizeof (krb5asrep_3_t);
 
   return esalt_size;
 }
 
-u32 module_pw_max (MAYBE_UNUSED const hashconfig_t *hashconfig, MAYBE_UNUSED const user_options_t *user_options, MAYBE_UNUSED const user_options_extra_t *user_options_extra)
+static u32 module_pw_max (MAYBE_UNUSED const hashconfig_t *hashconfig, MAYBE_UNUSED const user_options_t *user_options, MAYBE_UNUSED const user_options_extra_t *user_options_extra)
 {
   const u32 pw_max = MAX_PW_LEN;
 
   return pw_max;
 }
 
-int module_hash_decode (MAYBE_UNUSED const hashconfig_t *hashconfig, MAYBE_UNUSED void *digest_buf, MAYBE_UNUSED salt_t *salt, MAYBE_UNUSED void *esalt_buf, MAYBE_UNUSED void *hook_salt_buf, MAYBE_UNUSED hashinfo_t *hash_info, const char *line_buf, MAYBE_UNUSED const int line_len)
+static int module_hash_decode (MAYBE_UNUSED const hashconfig_t *hashconfig, MAYBE_UNUSED void *digest_buf, MAYBE_UNUSED salt_t *salt, MAYBE_UNUSED void *esalt_buf, MAYBE_UNUSED void *hook_salt_buf, MAYBE_UNUSED hashinfo_t *hash_info, const char *line_buf, MAYBE_UNUSED const int line_len)
 {
   u32 *digest = (u32 *) digest_buf;
 
@@ -87,13 +87,9 @@ int module_hash_decode (MAYBE_UNUSED const hashconfig_t *hashconfig, MAYBE_UNUSE
 
   memset (krb5asrep, 0, sizeof (krb5asrep_3_t));
 
-  /**
-   * format 1: $krb5asrep$3$user@realm:checksum$edata2
-   * format 2: $krb5asrep$3$user$realm$checksum$edata2
-   *
-   * The first is what GetNPUsers.py writes for every encryption type it has no branch of its own
-   * for, the principal and the realm joined the way the reply carries them. The second is the one
-   * 32100 and 32200 take, with the two apart.
+    /**
+   * format 1: $krb5asrep$3$user@realm:checksum$encrypted  (joined)
+   * format 2: $krb5asrep$3$user$realm$checksum$encrypted
    */
 
   token.signatures_cnt    = 1;
@@ -125,13 +121,12 @@ int module_hash_decode (MAYBE_UNUSED const hashconfig_t *hashconfig, MAYBE_UNUSE
     else if (colon < dollar) joined = true;
   }
 
-  // the two shapes put the checksum and the data at different tokens
-
   u32 checksum_token = 0;
   u32 data_token     = 0;
 
   if (joined == true)
   {
+    // format 1: $krb5asrep$3$user@realm:checksum$encrypted  (joined)
     token.token_cnt  = 4;
 
     checksum_token   = 2;
@@ -155,6 +150,8 @@ int module_hash_decode (MAYBE_UNUSED const hashconfig_t *hashconfig, MAYBE_UNUSE
   }
   else
   {
+    // format 2: $krb5asrep$3$user$realm$checksum$encrypted
+
     token.token_cnt  = 5;
 
     checksum_token   = 3;
@@ -286,7 +283,7 @@ int module_hash_decode (MAYBE_UNUSED const hashconfig_t *hashconfig, MAYBE_UNUSE
   return (PARSER_OK);
 }
 
-int module_hash_encode (MAYBE_UNUSED const hashconfig_t *hashconfig, MAYBE_UNUSED const void *digest_buf, MAYBE_UNUSED const salt_t *salt, MAYBE_UNUSED const void *esalt_buf, MAYBE_UNUSED const void *hook_salt_buf, MAYBE_UNUSED const hashinfo_t *hash_info, char *line_buf, MAYBE_UNUSED const int line_size)
+static int module_hash_encode (MAYBE_UNUSED const hashconfig_t *hashconfig, MAYBE_UNUSED const void *digest_buf, MAYBE_UNUSED const salt_t *salt, MAYBE_UNUSED const void *esalt_buf, MAYBE_UNUSED const void *hook_salt_buf, MAYBE_UNUSED const hashinfo_t *hash_info, char *line_buf, MAYBE_UNUSED const int line_size)
 {
   const krb5asrep_3_t *krb5asrep = (const krb5asrep_3_t *) esalt_buf;
 
@@ -298,8 +295,6 @@ int module_hash_encode (MAYBE_UNUSED const hashconfig_t *hashconfig, MAYBE_UNUSE
   {
     snprintf (data + j, 3, "%02x", ptr_edata2[i]);
   }
-
-  // the line goes back out in the shape it came in as
 
   int line_len;
 
