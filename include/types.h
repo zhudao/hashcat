@@ -105,6 +105,7 @@ typedef enum event_identifier
   EVENT_BACKEND_RUNTIMES_INIT_PRE  = 0x00000131,
   EVENT_BACKEND_DEVICES_INIT_POST  = 0x00000132,
   EVENT_BACKEND_DEVICES_INIT_PRE   = 0x00000133,
+  EVENT_BACKEND_RUNTIME_SLOW       = 0x00000134,
   EVENT_BITMAP_INIT_POST           = 0x00000010,
   EVENT_BITMAP_INIT_PRE            = 0x00000011,
   EVENT_BITMAP_FINAL_OVERFLOW      = 0x00000012,
@@ -164,6 +165,7 @@ typedef enum event_identifier
   EVENT_BACKEND_DEVICE_INIT_PRE    = 0x000000a4,
   EVENT_OUTCHECK_PREFLIGHT_POST    = 0x00000150,
   EVENT_OUTCHECK_PREFLIGHT_PRE     = 0x00000151,
+  EVENT_OUTCHECK_CRACKED           = 0x00000152,
   EVENT_OUTERLOOP_FINISHED         = 0x000000b0,
   EVENT_OUTERLOOP_MAINSCREEN       = 0x000000b1,
   EVENT_OUTERLOOP_STARTING         = 0x000000b2,
@@ -656,6 +658,11 @@ typedef enum rule_functions
   RULE_OP_MANGLE_EXTRACT           = 'x',
   RULE_OP_MANGLE_OMIT              = 'O',
   RULE_OP_MANGLE_INSERT            = 'i',
+
+  // JtR's AN"STR", string STR at position N or at the end for N = z. Only the host reads it: the
+  // device gets it as one append, prepend or insert per byte.
+
+  RULE_OP_MANGLE_INSERT_STRING     = 'A',
   RULE_OP_MANGLE_OVERSTRIKE        = 'o',
   RULE_OP_MANGLE_TRUNCATE_AT       = '\'',
   RULE_OP_MANGLE_REPLACE           = 's',
@@ -979,6 +986,7 @@ typedef enum parser_rc
   PARSER_ZLIB_UNAVAILABLE         = -53,
 
   PARSER_SEVEN_ZIP_METHOD_UNSUPPORTED = -54,
+  PARSER_SEVEN_ZIP_TRUNCATED          = -55,
 
   PARSER_HAVE_ERRNO           = -100,
   PARSER_UNKNOWN_ERROR        = -255
@@ -1136,6 +1144,7 @@ typedef enum user_options_defaults
   STATUS_TIMER             = 10,
   STDIN_COUNT              = 0,
   STDIN_TIMEOUT_ABORT      = 120,
+  STDIN_TIMEOUT_FLUSH      = 0,
   STDOUT_FLAG              = false,
   USAGE                    = 0,
   USERNAME                 = false,
@@ -1174,11 +1183,13 @@ typedef enum user_options_map
   IDX_BRAIN_PORT                = 0xff0c,
   IDX_BRAIN_SERVER              = 0xff0d,
   IDX_BRAIN_SERVER_TIMER        = 0xff0e,
+  IDX_BRAIN_SERVER_DUMP_DIR     = 0xff92,
   IDX_BRAIN_SESSION             = 0xff0f,
   IDX_BRAIN_SESSION_WHITELIST   = 0xff10,
   #endif
   IDX_BYPASS_THRESHOLD          = 0xff84,
   IDX_BYPASS_DELAY              = 0xff85,
+  IDX_BYPASS_ETA                = 0xff91,
   IDX_COLOR_CRACKED             = 0xff59,
   IDX_BRIDGE_PARAMETER1         = 0xff80,
   IDX_BRIDGE_PARAMETER2         = 0xff81,
@@ -1283,6 +1294,7 @@ typedef enum user_options_map
   IDX_STDOUT_FLAG               = 0xff4d,
   IDX_STDIN_COUNT               = 0xff8f,
   IDX_STDIN_TIMEOUT_ABORT       = 0xff4e,
+  IDX_STDIN_TIMEOUT_FLUSH       = 0xff93,
   IDX_TOTAL_CANDIDATES          = 0xff58,
   IDX_USERNAME                  = 0xff50,
   IDX_VERSION                   = 'V',
@@ -2440,6 +2452,25 @@ typedef struct kernel_build
 
 } kernel_build_t;
 
+// The runtime that backend setup is waiting on, for the watchdog in hashcat_session_init ().
+
+typedef enum backend_phase
+{
+  BACKEND_PHASE_NONE   = 0,
+  BACKEND_PHASE_CUDA   = 1,
+  BACKEND_PHASE_HIP    = 2,
+  BACKEND_PHASE_METAL  = 3,
+  BACKEND_PHASE_OPENCL = 4,
+
+} backend_phase_t;
+
+typedef struct backend_slow
+{
+  backend_phase_t phase;
+  u32             seconds;
+
+} backend_slow_t;
+
 typedef struct backend_ctx
 {
   kernel_build_t     *kernel_builds;
@@ -2449,6 +2480,9 @@ typedef struct backend_ctx
   hc_thread_cond_t    cond_kernel_build;
 
   bool                enabled;
+
+  backend_phase_t     init_phase;
+  bool                init_done;
 
   // global rc
 
@@ -2617,6 +2651,7 @@ typedef struct hm_attrs
   int od_version;
 
   bool buslanes_get_supported;
+  bool busgen_get_supported;
   bool corespeed_get_supported;
   bool fanspeed_get_supported;
   bool fanpolicy_get_supported;
@@ -2875,6 +2910,12 @@ typedef struct restore_ctx
 
   bool write_failed;
 
+  // Set once this run has put a restore file of its own in place. Until then, a restore file at
+  // that path was left by an earlier session of the same name, and it is the only way back into
+  // that one.
+
+  bool written;
+
 } restore_ctx_t;
 
 typedef struct pidfile_ctx
@@ -2965,6 +3006,7 @@ typedef struct user_options
   bool         brain_server_timer_chgd;
   #endif
   bool         bypass_delay_chgd;
+  bool         bypass_eta_chgd;
   bool         bypass_threshold_chgd;
   bool         hash_mode_chgd;
   bool         identify;
@@ -3047,12 +3089,14 @@ typedef struct user_options
   bool         stdout_flag;
   bool         stdin_count_chgd;
   bool         stdin_timeout_abort_chgd;
+  bool         stdin_timeout_flush_chgd;
   bool         username;
   bool         version;
   bool         wordlist_autohex;
   #ifdef WITH_BRAIN
   char        *brain_host;
   char        *brain_password;
+  char        *brain_server_dump_dir;
   char        *brain_session_whitelist;
   #endif
   char        *bridge_parameter1;
@@ -3118,6 +3162,7 @@ typedef struct user_options
   u32          brain_attack;
   #endif
   u32          bypass_delay;
+  u32          bypass_eta;
   u32          bypass_threshold;
   u32          debug_mode;
   u32          hwmon_temp_abort;
@@ -3145,6 +3190,7 @@ typedef struct user_options
   u32          metal_compiler_runtime;
   u32          status_timer;
   u32          stdin_timeout_abort;
+  u32          stdin_timeout_flush;
   u32          usage;
   u64          limit;
   u64          skip;
@@ -3287,6 +3333,13 @@ typedef struct outcheck_ctx
   char *root_directory;
 
 } outcheck_ctx_t;
+
+typedef struct outcheck_cracked
+{
+  u32 digests;
+  u32 files;
+
+} outcheck_cracked_t;
 
 typedef struct straight_ctx
 {
@@ -3884,6 +3937,11 @@ typedef struct hashcat_status
   double      guess_mod_percent;
   char       *guess_charset;
   int         guess_mask_length;
+
+  // How many rules the attack applies to each base word, after chaining several rule files and
+  // after dropping the ones that do not convert. 0 when it applies none.
+
+  u32         guess_rules_count;
   char       *session;
   #ifdef WITH_BRAIN
   int         brain_session;
@@ -3905,8 +3963,10 @@ typedef struct hashcat_status
   u32         digests_done_pot;
   u32         digests_done_zero;
   u32         digests_done_new;
+  u32         digests_done_attack;
   double      digests_percent;
   double      digests_percent_new;
+  double      digests_percent_attack;
   u32         salts_cnt;
   u32         salts_done;
   double      salts_percent;
@@ -4070,6 +4130,8 @@ typedef struct status_ctx
 
   int bypass_digests_done_new;  // --bypass-threshold cracked counter
 
+  u32 attack_digests_done_new;  // digests_done_new when the current queue item started
+
   /**
    * timer
    */
@@ -4084,6 +4146,9 @@ typedef struct status_ctx
 
   time_t timer_bypass_start;
   time_t timer_bypass_cur;
+
+  bool bypass_eta_checked;      // --bypass-eta decides once per queue item
+  u64  bypass_eta_words_from;   // words_cur when the queue item started
 
   hc_timer_t timer_running;     // timer on current dict
   hc_timer_t timer_paused;      // timer on current dict
