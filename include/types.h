@@ -1149,7 +1149,6 @@ typedef enum user_options_defaults
   SKIP                     = 0,
   SLOW_CANDIDATES          = false,
   SPEED_ONLY               = false,
-  SPIN_DAMP                = 0,
   STATUS                   = false,
   STATUS_JSON              = false,
   PIPELINE_STATS           = false,
@@ -1300,7 +1299,6 @@ typedef enum user_options_map
   IDX_SKIP                      = 's',
   IDX_SLOW_CANDIDATES           = 'S',
   IDX_SPEED_ONLY                = 0xff48,
-  IDX_SPIN_DAMP                 = 0xff49,
   IDX_STATUS                    = 0xff4a,
   IDX_STATUS_JSON               = 0xff4b,
   IDX_STATUS_TIMER              = 0xff4c,
@@ -1868,6 +1866,30 @@ typedef enum pipe_slot
 
 } pipe_slot_t;
 
+typedef struct kernel_exec_shape
+{
+  u64 num;
+  u64 threads;
+  u64 dimy;
+  u64 vector_width;
+  u64 items_per_candidate;
+  u64 shared_mem;
+
+} kernel_exec_shape_t;
+
+// The first init, loop and comp launch of one salt in a chunk of the salt inner order, and the loop
+// count of the loop launch. num is the launch size they were taken at.
+
+#define LAUNCH_SALT_KERNS 3
+
+typedef struct launch_salt
+{
+  u64   num;
+  float us[LAUNCH_SALT_KERNS];
+  u32   loops;
+
+} launch_salt_t;
+
 typedef struct hc_device_param
 {
   // Per device, because a device thread books only its own launches. These used to be one set of
@@ -2174,7 +2196,33 @@ typedef struct hc_device_param
 
   // workaround cpu spinning
 
-  double  exec_us_prev[HC_DEV_KERN_CNT][EXPECTED_ITERATIONS];
+  // A float holds a launch time in microseconds closely enough, so the time and the loop count of a
+  // launch take eight bytes together. hc_device_param_t is allocated DEVICES_MAX times, and
+  // brain_feed () keeps one on its stack.
+
+  float   exec_us_prev[HC_DEV_KERN_CNT][EXPECTED_ITERATIONS];
+  u32     exec_loops_prev[HC_DEV_KERN_CNT][EXPECTED_ITERATIONS];
+  kernel_exec_shape_t exec_us_prev_shape[HC_DEV_KERN_CNT];
+
+  // the last launch of each kernel in the current shape
+
+  float   exec_us_last[HC_DEV_KERN_CNT];
+  u32     exec_loops_last[HC_DEV_KERN_CNT];
+
+  // the salt inner order predicts from the salt itself, see launch_salt_t
+
+  launch_salt_t *launch_salt;
+
+  u32     launch_chunk;
+  float   launch_factor[LAUNCH_SALT_KERNS];
+  u32     launch_factor_chunk[LAUNCH_SALT_KERNS];
+
+  // the last launch of each kernel, for the next launch of the same salt in the same chunk
+
+  u32     launch_last_salt[LAUNCH_SALT_KERNS];
+  u32     launch_last_chunk[LAUNCH_SALT_KERNS];
+  u32     launch_last_loops[LAUNCH_SALT_KERNS];
+  float   launch_last_us[LAUNCH_SALT_KERNS];
 
   // this is "current" speed
 
@@ -2212,8 +2260,6 @@ typedef struct hc_device_param
   bool    has_bfe;
   bool    has_lop3;
   bool    has_shfw;
-
-  double  spin_damp;
 
   // How early the launch wait wakes up before a launch is expected to end, and the pinned host
   // memory a cracking launch uploads its parameters from and copies the crack count back into.
@@ -3050,7 +3096,6 @@ typedef struct user_options
   bool         kernel_accel_chgd;
   bool         kernel_loops_chgd;
   bool         kernel_threads_chgd;
-  bool         spin_damp_chgd;
   bool         backend_vector_width_chgd;
   bool         outfile_chgd;
   bool         outfile_format_chgd;
@@ -3210,7 +3255,6 @@ typedef struct user_options
   u32          kernel_loops;
   u32          kernel_threads;
   u32          markov_threshold;
-  u32          spin_damp;
   u32          backend_vector_width;
   u32          outfile_check_timer;
   u32          outfile_format;

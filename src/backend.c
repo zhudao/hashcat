@@ -2516,7 +2516,36 @@ bool is_opti_kernel_no_pcfg (const hashcat_ctx_t *hashcat_ctx)
   return true;
 }
 
-int choose_kernel (hashcat_ctx_t *hashcat_ctx, hc_device_param_t *device_param, const u32 highest_pw_len, const u64 pws_pos, const u64 pws_cnt, const u32 fast_iteration, const u32 salt_pos, const bool is_autotune)
+static int prepare_candidates (hashcat_ctx_t *hashcat_ctx, hc_device_param_t *device_param, const u64 pws_cnt)
+{
+  const hashconfig_t   *hashconfig   = hashcat_ctx->hashconfig;
+  const user_options_t *user_options = hashcat_ctx->user_options;
+
+  if (user_options->slow_candidates == false)
+  {
+    const u64 amp_base_cnt = (device_param->amp_base_cnt > 0) ? device_param->amp_base_cnt : pws_cnt;
+
+    // A single-item mask amplifier updates the coalesced base copy in place, because building those
+    // candidates in the kernel copies a whole pw_t per work item, which a slow hash with few
+    // iterations pays for in full.
+
+    if ((user_options->attack_mode == ATTACK_MODE_BF) && (amp_base_cnt == pws_cnt))
+    {
+      if (hc_dev_memcpy_d2d (hashcat_ctx, device_param, device_param->d_buf[HC_DEV_BUF_PWS_BUF], 0, device_param->d_buf[HC_DEV_BUF_PWS_AMP_BUF], 0, pws_cnt * sizeof (pw_t)) == -1) return -1;
+    }
+
+    if (run_kernel_amp (hashcat_ctx, device_param, amp_base_cnt, pws_cnt) == -1) return -1;
+  }
+
+  if (hashconfig->opts_type & OPTS_TYPE_POST_AMP_UTF16LE)
+  {
+    if (run_kernel_utf8toutf16le (hashcat_ctx, device_param, device_param->d_buf[HC_DEV_BUF_PWS_BUF], pws_cnt) == -1) return -1;
+  }
+
+  return 0;
+}
+
+static int choose_kernel_run (hashcat_ctx_t *hashcat_ctx, hc_device_param_t *device_param, const u32 highest_pw_len, const u64 pws_pos, const u64 pws_cnt, const u32 fast_iteration, const u32 salt_pos, const bool is_autotune, const bool candidates_prepared)
 {
   bridge_ctx_t   *bridge_ctx   = hashcat_ctx->bridge_ctx;
   hashconfig_t   *hashconfig   = hashcat_ctx->hashconfig;
@@ -2643,30 +2672,9 @@ int choose_kernel (hashcat_ctx_t *hashcat_ctx, hc_device_param_t *device_param, 
 
     if (true)
     {
-      // The amp kernel writes every candidate of the launch from the base words in pws_amp, the copy of
-      // the base word included. A slow candidate is finished when it reaches the device, so it has no
-      // amp kernel and the decompress kernel wrote it into pws_buf, where the launch reads it.
-
-      if (user_options->slow_candidates == false)
+      if (candidates_prepared == false)
       {
-        const u64 amp_base_cnt = (device_param->amp_base_cnt > 0) ? device_param->amp_base_cnt : pws_cnt;
-
-        // The exception is a mask launch with one amplifier item. Its base words go across in one
-        // coalesced copy and amp_a3 sets the first word in place, because building those candidates
-        // in the kernel copies a whole pw_t per work item, which a slow hash with few iterations pays
-        // for in full.
-
-        if ((user_options->attack_mode == ATTACK_MODE_BF) && (amp_base_cnt == pws_cnt))
-        {
-          if (hc_dev_memcpy_d2d (hashcat_ctx, device_param, device_param->d_buf[HC_DEV_BUF_PWS_BUF], 0, device_param->d_buf[HC_DEV_BUF_PWS_AMP_BUF], 0, pws_cnt * sizeof (pw_t)) == -1) return -1;
-        }
-
-        if (run_kernel_amp (hashcat_ctx, device_param, amp_base_cnt, pws_cnt) == -1) return -1;
-      }
-
-      if (hashconfig->opts_type & OPTS_TYPE_POST_AMP_UTF16LE)
-      {
-        if (run_kernel_utf8toutf16le (hashcat_ctx, device_param, device_param->d_buf[HC_DEV_BUF_PWS_BUF], pws_cnt) == -1) return -1;
+        if (prepare_candidates (hashcat_ctx, device_param, pws_cnt) == -1) return -1;
       }
 
       if (hashconfig->kern_bits & KERN_BIT_INIT)
@@ -3158,6 +3166,13 @@ int choose_kernel (hashcat_ctx_t *hashcat_ctx, hc_device_param_t *device_param, 
   }
 
   return 0;
+}
+
+int choose_kernel (hashcat_ctx_t *hashcat_ctx, hc_device_param_t *device_param, const u32 highest_pw_len, const u64 pws_pos, const u64 pws_cnt, const u32 fast_iteration, const u32 salt_pos, const bool is_autotune)
+{
+  const int rc = choose_kernel_run (hashcat_ctx, device_param, highest_pw_len, pws_pos, pws_cnt, fast_iteration, salt_pos, is_autotune, false);
+
+  return rc;
 }
 
 static void rebuild_pws_compressed_append (hc_device_param_t *device_param, const u64 pws_cnt, const u8 chr)
@@ -4014,6 +4029,171 @@ static void launch_wait (hashcat_ctx_t *hashcat_ctx, hc_device_param_t *device_p
   device_param->launch_margin_us = margin_us;
 }
 
+// Where a kernel's time sits in launch_salt_t. The loop extended kernel keeps none. VeraCrypt runs its
+// header check only in the launch that crosses a PIM boundary, so that time is not the salt's.
+
+static u32 launch_salt_idx (const u32 slot)
+{
+  if (slot == HC_DEV_KERN_1) return 0;
+  if (slot == HC_DEV_KERN_2) return 1;
+  if (slot == HC_DEV_KERN_3) return 2;
+
+  return LAUNCH_SALT_KERNS;
+}
+
+// In the salt inner order every salt reaches a loop position in turn, so a position holds the previous
+// salt's launch. Salts can differ in cost at the same loop count, Argon2 hashes in their memory size or
+// zip entries in their length. A slow hash therefore predicts from the salt itself where it can.
+//
+// A launch that follows a launch of the same kernel for the same salt in the same chunk takes that
+// launch: the later loop launches, and the comp launch of each further digest. The first init, loop
+// and comp launch of a salt in a chunk take the salt's own record from the chunk before.
+//
+// The candidates of a chunk can make every salt cheaper alike, as a shorter password does for RAR3.
+// The record is then scaled by how much the chunk changed the salt before it. The first salt of a
+// chunk has no such salt and takes its record as it is.
+//
+// The position is the fallback while a salt has no record of this launch size.
+
+static void launch_salt_expected (const hc_device_param_t *device_param, const u32 slot, double *recorded_us, u32 *recorded_loops)
+{
+  if (device_param->launch_salt == NULL) return;
+
+  const u32 idx = launch_salt_idx (slot);
+
+  if (idx == LAUNCH_SALT_KERNS) return;
+
+  const u32 salt_pos = device_param->kernel_param.salt_pos_host;
+
+  if ((device_param->launch_last_salt[idx] == salt_pos) && (device_param->launch_last_chunk[idx] == device_param->launch_chunk))
+  {
+    recorded_us[0]    = device_param->launch_last_us[idx];
+    recorded_loops[0] = device_param->launch_last_loops[idx];
+
+    return;
+  }
+
+  const launch_salt_t *own = &device_param->launch_salt[salt_pos];
+
+  if (own->num != device_param->kernel_param.gid_max) return;
+
+  if (own->us[idx] == 0) return;
+
+  const double factor = (device_param->launch_factor_chunk[idx] == device_param->launch_chunk) ? device_param->launch_factor[idx] : 1;
+
+  recorded_us[0]    = own->us[idx] * factor;
+  recorded_loops[0] = (slot == HC_DEV_KERN_2) ? own->loops : 0;
+}
+
+static void launch_salt_record (hc_device_param_t *device_param, const u32 slot, const u32 loops, const double exec_us)
+{
+  if (device_param->launch_salt == NULL) return;
+
+  const u32 idx = launch_salt_idx (slot);
+
+  if (idx == LAUNCH_SALT_KERNS) return;
+
+  const u32 salt_pos = device_param->kernel_param.salt_pos_host;
+
+  const u32 chunk = device_param->launch_chunk;
+
+  // a later launch of the kernel for the salt, which keeps the launch with the most loops as a position
+  // does
+
+  const bool again = (device_param->launch_last_salt[idx] == salt_pos) && (device_param->launch_last_chunk[idx] == chunk);
+
+  if ((again == true) && (loops < device_param->launch_last_loops[idx])) return;
+
+  device_param->launch_last_salt[idx]  = salt_pos;
+  device_param->launch_last_chunk[idx] = chunk;
+  device_param->launch_last_loops[idx] = loops;
+  device_param->launch_last_us[idx]    = (float) exec_us;
+
+  if (again == true) return;
+
+  launch_salt_t *own = &device_param->launch_salt[salt_pos];
+
+  const u64 num = device_param->kernel_param.gid_max;
+
+  // How much this chunk changed the cost since the salt's record, per loop for a loop launch. A launch
+  // too short to be slept through measures mostly noise. The factor only ever shortens a prediction. One
+  // that is too short polls for the rest, and one that is too long leaves the device idle.
+
+  if ((own->num == num) && (own->us[idx] >= LAUNCH_POLL_MIN_US) && (exec_us >= LAUNCH_POLL_MIN_US))
+  {
+    double factor = exec_us / own->us[idx];
+
+    if ((slot == HC_DEV_KERN_2) && (own->loops > 0) && (loops > 0)) factor = (factor * own->loops) / loops;
+
+    device_param->launch_factor[idx]       = (float) MIN (factor, 1);
+    device_param->launch_factor_chunk[idx] = chunk;
+  }
+
+  if (own->num != num)
+  {
+    memset (own, 0, sizeof (launch_salt_t));
+
+    own->num = num;
+  }
+
+  own->us[idx] = (float) exec_us;
+
+  if (slot == HC_DEV_KERN_2) own->loops = loops;
+}
+
+// Salts of different iteration counts take turns at the same loop position in the salt inner order,
+// and the last launch of a salt runs fewer loops than a full one. So a loop position keeps the launch
+// with the most loops it has seen, and a launch with fewer scales that time down. Sleeping for the
+// full time would wake the host after a short launch has ended, and the device would sit idle until
+// then. Until the longest launch has been seen, a longer one sleeps for the recorded time and polls
+// for the rest.
+//
+// On CUDA a loop position this shape has not reached yet takes the last loop launch of the same kernel
+// instead, scaled the same way. cuda_event_done has no blocking sync, so a launch without a prediction
+// spins in cuEventSynchronize () for as long as it runs. Without the borrowed time, every loop launch
+// of the first salt after a shape change would do so, and with it only the first one does.
+//
+// A launch without a loop count, which includes every fast hash launch, borrows nothing, because there
+// is no count to scale the borrowed time by. Neither does the loop extended kernel, whose time does not
+// follow its loop count: VeraCrypt runs the header check only in a launch that crosses a PIM boundary.
+// HIP and OpenCL keep the recorded times alone. HIP sleeps in its synchronize
+// (hipDeviceScheduleBlockingSync), and OpenCL leaves the wait to the runtime. On both, a borrowed
+// prediction under twice the margin would be polled to its end instead, which costs CPU time.
+
+static double launch_expected_us (const hc_device_param_t *device_param, const u32 slot, const u32 iterationm, const u32 loops)
+{
+  double recorded_us = device_param->exec_us_prev[slot][iterationm];
+
+  u32 recorded_loops = device_param->exec_loops_prev[slot][iterationm];
+
+  launch_salt_expected (device_param, slot, &recorded_us, &recorded_loops);
+
+  if ((recorded_us == 0) && (loops > 0) && (slot != HC_DEV_KERN_2E) && (device_param->is_cuda == true))
+  {
+    recorded_us    = device_param->exec_us_last[slot];
+    recorded_loops = device_param->exec_loops_last[slot];
+  }
+
+  if (loops >= recorded_loops) return recorded_us;
+
+  const double expected_us = (recorded_us * loops) / recorded_loops;
+
+  return expected_us;
+}
+
+static void launch_record (hc_device_param_t *device_param, const u32 slot, const u32 iterationm, const u32 loops, const double exec_us)
+{
+  launch_salt_record (device_param, slot, loops, exec_us);
+
+  device_param->exec_us_last[slot]    = (float) exec_us;
+  device_param->exec_loops_last[slot] = loops;
+
+  if (device_param->exec_loops_prev[slot][iterationm] > loops) return;
+
+  device_param->exec_us_prev[slot][iterationm]    = (float) exec_us;
+  device_param->exec_loops_prev[slot][iterationm] = loops;
+}
+
 // Whether this session loads the run kernels beside the single-hash ones: a mode that has them, a
 // single hash, and a brute-force attack on the device, which is the one kernel file that carries
 // them. --slow-candidates builds the straight kernel file and so has none to load.
@@ -4145,6 +4325,37 @@ int run_kernel (hashcat_ctx_t *hashcat_ctx, hc_device_param_t *device_param, con
       dimy = CEILDIV (salt_dimy, dimy_rounds);
     }
   }
+
+  const kernel_exec_shape_t exec_shape =
+  {
+    .num                 = num,
+    .threads             = MAX (kernel_threads, 1),
+    .dimy                = dimy,
+    .vector_width        = launch_vector_width (hashconfig, device_param, kern_run),
+    .items_per_candidate = launch_items_per_candidate (device_param, kern_run, MAX (kernel_threads, 1)),
+    .shared_mem          = dynamic_shared_mem,
+  };
+
+  // A shorter launch must not inherit the predicted wait of a full batch.
+
+  if (memcmp (&device_param->exec_us_prev_shape[slot], &exec_shape, sizeof (exec_shape)) != 0)
+  {
+    memset (device_param->exec_us_prev[slot],    0, sizeof (device_param->exec_us_prev[slot]));
+    memset (device_param->exec_loops_prev[slot], 0, sizeof (device_param->exec_loops_prev[slot]));
+
+    device_param->exec_us_last[slot]    = 0;
+    device_param->exec_loops_last[slot] = 0;
+
+    device_param->exec_us_prev_shape[slot] = exec_shape;
+  }
+
+  // Only the loop launches of a slow hash run loop_cnt loops. A fast hash kernel ignores loop_cnt, which
+  // keeps whatever autotune left in it. A slow hash launch that passes no event_update is not a loop
+  // launch either. Every other launch therefore counts as having none.
+
+  const bool has_loops = (event_update != 0) && (hashconfig->attack_exec == ATTACK_EXEC_OUTSIDE_KERNEL);
+
+  const u32 launch_loops = (has_loops == true) ? (u32) device_param->kernel_param.loop_cnt : 0;
 
   device_param->kernel_param.pws_pos = pws_pos;
   device_param->kernel_param.gid_max = num;
@@ -4297,7 +4508,7 @@ int run_kernel (hashcat_ctx_t *hashcat_ctx, hc_device_param_t *device_param, con
 
       done = device_param->cuda_event_done;
 
-      launch_wait (hashcat_ctx, device_param, device_param->exec_us_prev[slot][iterationm], NULL);
+      launch_wait (hashcat_ctx, device_param, launch_expected_us (device_param, slot, iterationm, launch_loops), NULL);
     }
 
     if (hc_cuEventSynchronize (hashcat_ctx, done) == -1) return -1;
@@ -4310,7 +4521,7 @@ int run_kernel (hashcat_ctx_t *hashcat_ctx, hc_device_param_t *device_param, con
     {
       device_param->launch_result_valid = true;
 
-      device_param->exec_us_prev[slot][iterationm] = exec_ms * 1000;
+      launch_record (device_param, slot, iterationm, launch_loops, exec_ms * 1000);
     }
 
     if (event_update)
@@ -4438,7 +4649,7 @@ int run_kernel (hashcat_ctx_t *hashcat_ctx, hc_device_param_t *device_param, con
 
       done = device_param->hip_event_done;
 
-      launch_wait (hashcat_ctx, device_param, device_param->exec_us_prev[slot][iterationm], NULL);
+      launch_wait (hashcat_ctx, device_param, launch_expected_us (device_param, slot, iterationm, launch_loops), NULL);
     }
 
     if (hc_hipEventSynchronize (hashcat_ctx, done) == -1) return -1;
@@ -4451,7 +4662,7 @@ int run_kernel (hashcat_ctx_t *hashcat_ctx, hc_device_param_t *device_param, con
     {
       device_param->launch_result_valid = true;
 
-      device_param->exec_us_prev[slot][iterationm] = exec_ms * 1000;
+      launch_record (device_param, slot, iterationm, launch_loops, exec_ms * 1000);
     }
 
     if (event_update)
@@ -4641,9 +4852,9 @@ int run_kernel (hashcat_ctx_t *hashcat_ctx, hc_device_param_t *device_param, con
       if (hc_clSetKernelArg (hashcat_ctx, opencl_kernel, i, sizeof (cl_mem), device_param->kernel_params[i]) == -1) return -1;
     }
 
-    // --spin-damp keeps the wait it asked for, and a CPU device has no idle device to wait for.
+    // A CPU device has no idle device to wait for.
 
-    const bool pinned = (is_autotune == false) && (status_ctx->devices_status == STATUS_RUNNING) && (device_param->spin_damp == 0) && ((device_param->opencl_device_type & CL_DEVICE_TYPE_CPU) == 0) && (device_param->launch_param_host != NULL) && (device_param->launch_result_host != NULL);
+    const bool pinned = (is_autotune == false) && (status_ctx->devices_status == STATUS_RUNNING) && ((device_param->opencl_device_type & CL_DEVICE_TYPE_CPU) == 0) && (device_param->launch_param_host != NULL) && (device_param->launch_result_host != NULL);
 
     if (pinned == true)
     {
@@ -4769,7 +4980,7 @@ int run_kernel (hashcat_ctx_t *hashcat_ctx, hc_device_param_t *device_param, con
 
       if (hc_clFlush (hashcat_ctx, device_param->opencl_command_queue) == -1) return -1;
 
-      launch_wait (hashcat_ctx, device_param, device_param->exec_us_prev[slot][iterationm], read_event);
+      launch_wait (hashcat_ctx, device_param, launch_expected_us (device_param, slot, iterationm, launch_loops), read_event);
 
       if (hc_clWaitForEvents (hashcat_ctx, 1, &read_event) == -1) return -1;
 
@@ -4778,49 +4989,7 @@ int run_kernel (hashcat_ctx_t *hashcat_ctx, hc_device_param_t *device_param, con
       device_param->launch_result_valid = true;
     }
 
-    // spin damper section
-
-    if (device_param->spin_damp > 0)
-    {
-      cl_int opencl_event_status;
-
-      size_t param_value_size_ret;
-
-      if (hc_clFlush (hashcat_ctx, device_param->opencl_command_queue) == -1) return -1;
-
-      if (hc_clGetEventInfo (hashcat_ctx, opencl_event, CL_EVENT_COMMAND_EXECUTION_STATUS, sizeof (opencl_event_status), &opencl_event_status, &param_value_size_ret) == -1) return -1;
-
-      double spin_total = device_param->spin_damp;
-
-      while (opencl_event_status != CL_COMPLETE)
-      {
-        if (status_ctx->devices_status == STATUS_RUNNING)
-        {
-          if (device_param->exec_us_prev[slot][iterationm] > 0) usleep ((useconds_t) (device_param->exec_us_prev[slot][iterationm] * device_param->spin_damp));
-        }
-        else
-        {
-          // we were told to be nice
-
-          sleep (0);
-        }
-
-        if (hc_clGetEventInfo (hashcat_ctx, opencl_event, CL_EVENT_COMMAND_EXECUTION_STATUS, sizeof (opencl_event_status), &opencl_event_status, &param_value_size_ret) == -1) return -1;
-
-        spin_total += device_param->spin_damp;
-
-        if (spin_total > 1)
-        {
-          if (hc_clWaitForEvents (hashcat_ctx, 1, &opencl_event) == -1) return -1;
-
-          break;
-        }
-      }
-    }
-    else
-    {
-      if (hc_clWaitForEvents (hashcat_ctx, 1, &opencl_event) == -1) return -1;
-    }
+    if (hc_clWaitForEvents (hashcat_ctx, 1, &opencl_event) == -1) return -1;
 
     cl_ulong time_start;
     cl_ulong time_end;
@@ -4830,11 +4999,11 @@ int run_kernel (hashcat_ctx_t *hashcat_ctx, hc_device_param_t *device_param, con
 
     const double exec_us = (double) (time_end - time_start) / 1000;
 
-    if ((device_param->spin_damp > 0) || (pinned == true))
+    if (pinned == true)
     {
       if (status_ctx->devices_status == STATUS_RUNNING)
       {
-        device_param->exec_us_prev[slot][iterationm] = exec_us;
+        launch_record (device_param, slot, iterationm, launch_loops, exec_us);
       }
     }
 
@@ -6422,9 +6591,6 @@ static u64 slow_amp_step (const hashcat_ctx_t *hashcat_ctx, const hc_device_para
   return step;
 }
 
-// The salt loop outside the amplifier loop, which is the order hashcat has always used. Every attack
-// runs this unless the salt inner order below is switched on for a slow hash.
-
 // A paused run is waiting on a keypress. Polling the flag once a second means a device can sit idle
 // for most of a second after the user presses resume, and a quit taken while paused waits the same
 // way. Reading the flag costs nothing, so poll it ten times a second, which is what the monitor and
@@ -6437,6 +6603,9 @@ static void wait_while_paused (const status_ctx_t *status_ctx)
     usleep (100000);
   }
 }
+
+// The salt loop outside the amplifier loop, which is the salt outer order. A fast hash runs this, and
+// so do -a 9, speed_only and the PCFG device engine, the cases salt_inner_enabled () leaves out.
 
 static int run_cracker_salt_major (hashcat_ctx_t *hashcat_ctx, hc_device_param_t *device_param, const u64 pws_pos, const u64 pws_cnt, const u32 highest_pw_len, const pw_transform_t *transform)
 {
@@ -6583,7 +6752,16 @@ static int run_cracker_salt_major (hashcat_ctx_t *hashcat_ctx, hc_device_param_t
 
         if (amp_prepare (hashcat_ctx, device_param, innerloop_pos, &innerloop_left, transform, &amp_rejects) == -1) return -1;
 
-        combs_buf_reject (hashcat_ctx, salt_pos, pws_cnt, amp_rejects);
+        // the dispatcher books rejects against the same salt under this lock
+
+        if (amp_rejects > 0)
+        {
+          hc_thread_mutex_lock (status_ctx->mux_counter);
+
+          combs_buf_reject (hashcat_ctx, salt_pos, pws_cnt, amp_rejects);
+
+          hc_thread_mutex_unlock (status_ctx->mux_counter);
+        }
       }
 
       // Every amplifier item in the chunk was rejected, so there is nothing to launch. The amplifier
@@ -6798,6 +6976,7 @@ static int run_cracker_amp_major (hashcat_ctx_t *hashcat_ctx, hc_device_param_t 
   mask_ctx_t            *mask_ctx           = hashcat_ctx->mask_ctx;
   status_ctx_t          *status_ctx         = hashcat_ctx->status_ctx;
   straight_ctx_t        *straight_ctx       = hashcat_ctx->straight_ctx;
+  const user_options_t  *user_options       = hashcat_ctx->user_options;
   user_options_extra_t  *user_options_extra = hashcat_ctx->user_options_extra;
 
   const u32 salts_cnt = hashes->salts_cnt;
@@ -6831,6 +7010,8 @@ static int run_cracker_amp_major (hashcat_ctx_t *hashcat_ctx, hc_device_param_t 
   else if (user_options_extra->attack_kern == ATTACK_KERN_COMBI)     innerloop_cnt = combinator_ctx->combs_cnt;
   else if (user_options_extra->attack_kern == ATTACK_KERN_BF)        innerloop_cnt = mask_ctx->bfs_cnt;
 
+  if (user_options->slow_candidates == true) innerloop_cnt = 1;
+
   int rc_final = 0;
 
   for (u64 innerloop_pos = 0; innerloop_pos < innerloop_cnt; innerloop_pos += innerloop_step)
@@ -6862,11 +7043,18 @@ static int run_cracker_amp_major (hashcat_ctx_t *hashcat_ctx, hc_device_param_t 
 
     u32 live_cnt = 0;
 
+    // Every device credits the cracked salts, so the counters are taken under the same lock as the
+    // launches below book theirs.
+
+    const u64 cracked_step = progress_step (hashcat_ctx, device_param, pws_cnt, innerloop_left);
+
+    hc_thread_mutex_lock (status_ctx->mux_counter);
+
     for (u32 salt_pos = 0; salt_pos < salts_cnt; salt_pos++)
     {
       if (hashes->salts_shown[salt_pos] == 1)
       {
-        status_ctx->words_progress_done[salt_pos] += progress_step (hashcat_ctx, device_param, pws_cnt, innerloop_left);
+        status_ctx->words_progress_done[salt_pos] += cracked_step;
 
         continue;
       }
@@ -6876,11 +7064,13 @@ static int run_cracker_amp_major (hashcat_ctx_t *hashcat_ctx, hc_device_param_t 
       live_cnt++;
     }
 
+    hc_thread_mutex_unlock (status_ctx->mux_counter);
+
     // every salt is done, so there is nothing to prepare the amplifier for
 
     if (live_cnt == 0) continue;
 
-    // the amplifier, once for every salt below rather than once each
+    // Stage the modifier chunk shared by the salt sweep.
 
     u64 amp_rejects = 0;
 
@@ -6895,9 +7085,13 @@ static int run_cracker_amp_major (hashcat_ctx_t *hashcat_ctx, hc_device_param_t 
     // against it, which under the salt major order is exactly the salts that would each have read it
     // and dropped it themselves.
 
-    for (u32 live_pos = 0; live_pos < live_cnt; live_pos++)
+    if (amp_rejects > 0)
     {
-      combs_buf_reject (hashcat_ctx, live_salts[live_pos], pws_cnt, amp_rejects);
+      hc_thread_mutex_lock (status_ctx->mux_counter);
+
+      for (u32 live_pos = 0; live_pos < live_cnt; live_pos++) combs_buf_reject (hashcat_ctx, live_salts[live_pos], pws_cnt, amp_rejects);
+
+      hc_thread_mutex_unlock (status_ctx->mux_counter);
     }
 
     // Every amplifier item in the chunk was rejected, so there is nothing to launch. The amplifier
@@ -6905,6 +7099,25 @@ static int run_cracker_amp_major (hashcat_ctx_t *hashcat_ctx, hc_device_param_t 
     // chunk left behind.
 
     if (innerloop_left == 0) continue;
+
+    const u64 launch_cnt = (device_param->amp_base_cnt > 0) ? pws_cnt * innerloop_left : pws_cnt;
+
+    hc_timer_t timer_prepare;
+
+    pipe_mark (&timer_prepare);
+
+    if (prepare_candidates (hashcat_ctx, device_param, launch_cnt) == -1)
+    {
+      rc_final = -1;
+
+      break;
+    }
+
+    pipe_acc (device_param, PIPE_INIT, &timer_prepare);
+
+    // a new chunk for the launch records, see launch_salt_t
+
+    device_param->launch_chunk++;
 
     for (u32 live_pos = 0; live_pos < live_cnt; live_pos++)
     {
@@ -6917,7 +7130,11 @@ static int run_cracker_amp_major (hashcat_ctx_t *hashcat_ctx, hc_device_param_t 
 
       if (hashes->salts_shown[salt_pos] == 1)
       {
+        hc_thread_mutex_lock (status_ctx->mux_counter);
+
         status_ctx->words_progress_done[salt_pos] += progress_step (hashcat_ctx, device_param, pws_cnt, innerloop_left);
+
+        hc_thread_mutex_unlock (status_ctx->mux_counter);
 
         continue;
       }
@@ -6928,9 +7145,7 @@ static int run_cracker_amp_major (hashcat_ctx_t *hashcat_ctx, hc_device_param_t 
       device_param->kernel_param.digests_cnt         = salt_buf->digests_cnt;
       device_param->kernel_param.digests_offset_host = salt_buf->digests_offset;
 
-      const u64 launch_cnt = (device_param->amp_base_cnt > 0) ? pws_cnt * innerloop_left : pws_cnt;
-
-      if (choose_kernel (hashcat_ctx, device_param, highest_pw_len, pws_pos, launch_cnt, fast_iteration, salt_pos, false) == -1)
+      if (choose_kernel_run (hashcat_ctx, device_param, highest_pw_len, pws_pos, launch_cnt, fast_iteration, salt_pos, false, true) == -1)
       {
         rc_final = -1;
 
@@ -6982,14 +7197,13 @@ static int run_cracker_amp_major (hashcat_ctx_t *hashcat_ctx, hc_device_param_t 
   return rc_final;
 }
 
-// Which of the two orders an attack runs. The salt inner order is off unless the environment asks for
-// it, because what it changes is the order hashes land in the pot and that has to be measured on real
-// hardware before it becomes what everyone gets.
+// A slow attack tests each prepared candidate chunk against the salts before advancing.
 
 static bool salt_inner_enabled (const hashcat_ctx_t *hashcat_ctx)
 {
-  const hashconfig_t   *hashconfig   = hashcat_ctx->hashconfig;
-  const user_options_t *user_options = hashcat_ctx->user_options;
+  const hashconfig_t         *hashconfig         = hashcat_ctx->hashconfig;
+  const user_options_t       *user_options       = hashcat_ctx->user_options;
+  const user_options_extra_t *user_options_extra = hashcat_ctx->user_options_extra;
 
   // a fast hash runs its amplifier loop inside the kernel, so there are no two host loops to exchange
 
@@ -7000,22 +7214,15 @@ static bool salt_inner_enabled (const hashcat_ctx_t *hashcat_ctx)
 
   if (user_options->attack_mode == ATTACK_MODE_ASSOCIATION) return false;
 
-  // slow candidates builds the whole candidate on the host, so innerloop_cnt is 1 and again there is
-  // no amplifier loop
-
-  if (user_options->slow_candidates == true) return false;
-
   // the benchmark measures one launch and stops, and it extrapolates from the nesting it knows
 
   if (user_options->speed_only == true) return false;
 
-  const char *env = getenv ("HASHCAT_SALT_INNER");
+  if (user_options_extra->attack_kern == ATTACK_KERN_STRAIGHT) return true;
+  if (user_options_extra->attack_kern == ATTACK_KERN_COMBI) return true;
+  if (user_options_extra->attack_kern == ATTACK_KERN_BF) return true;
 
-  if (env == NULL) return false;
-
-  const bool enabled = (atoi (env) != 0);
-
-  return enabled;
+  return false;
 }
 
 int run_cracker (hashcat_ctx_t *hashcat_ctx, hc_device_param_t *device_param, const u64 pws_pos_arg, const u64 pws_cnt)
@@ -8405,13 +8612,6 @@ static void backend_ctx_devices_init_cuda (hashcat_ctx_t *hashcat_ctx, int *virt
         backend_ctx->need_nvml = true;
       }
 
-      // CPU burning loop damper
-      // Value is given as number between 0-100
-      // By default 8%
-      // in theory not needed with CUDA
-
-      device_param->spin_damp = (double) user_options->spin_damp / 100;
-
       // common driver check
 
       if (device_param->skipped == false)
@@ -8986,12 +9186,6 @@ static void backend_ctx_devices_init_hip (hashcat_ctx_t *hashcat_ctx, int *virth
          backend_ctx->need_sysfs_amdgpu = true;
          #endif
       }
-      // CPU burning loop damper
-      // Value is given as number between 0-100
-      // By default 8%
-      // in theory not needed with HIP
-
-      device_param->spin_damp = (double) user_options->spin_damp / 100;
 
       // common driver check
 
@@ -9485,13 +9679,6 @@ static void backend_ctx_devices_init_metal (hashcat_ctx_t *hashcat_ctx, MAYBE_UN
       {
         backend_ctx->need_iokit = true;
       }
-
-      // CPU burning loop damper
-      // Value is given as number between 0-100
-      // By default 8%
-      // in theory not needed with Metal
-
-      device_param->spin_damp = 0;
 
       // common driver check
       /*
@@ -10802,12 +10989,6 @@ static void backend_ctx_devices_init_opencl (hashcat_ctx_t *hashcat_ctx, int *vi
             }
 
             device_param->kernel_exec_timeout = kernel_exec_timeout;
-
-            // CPU burning loop damper
-            // Value is given as number between 0-100
-            // By default 8%
-
-            device_param->spin_damp = (double) user_options->spin_damp / 100;
 
             if (user_options->stdout_flag == false)
             {
@@ -18422,6 +18603,13 @@ int backend_session_begin (hashcat_ctx_t *hashcat_ctx)
 
     device_param->scratch_buf = scratch_buf;
 
+    // One launch record per salt, see launch_salt_t. Only the salt inner order with more than one salt
+    // takes turns at a loop position. Only a launch that is waited on reads a prediction.
+
+    const bool launch_salt_wanted = (salt_inner_enabled (hashcat_ctx) == true) && (hashes->salts_cnt > 1) && (device_param->launch_param_host != NULL) && (device_param->launch_result_host != NULL);
+
+    device_param->launch_salt = (launch_salt_wanted == true) ? (launch_salt_t *) hccalloc (hashes->salts_cnt, sizeof (launch_salt_t)) : NULL;
+
     #ifdef WITH_BRAIN
     u8 *brain_link_in_buf = (u8 *) hcmalloc (size_brain_link_in);
 
@@ -18727,10 +18915,16 @@ void backend_session_destroy (hashcat_ctx_t *hashcat_ctx)
     hcfree (device_param->combs_buf);
     hcfree (device_param->hooks_buf);
     hcfree (device_param->scratch_buf);
+    hcfree (device_param->launch_salt);
     #ifdef WITH_BRAIN
     hcfree (device_param->brain_link_in_buf);
     hcfree (device_param->brain_link_out_buf);
     #endif
+
+    // at once, because a failed context push below skips the resets at the end, and the next destroy
+    // would free it again
+
+    device_param->launch_salt = NULL;
 
     // CUDA's frees are driver calls against this device, and this is the main thread, which carries
     // no context of its own now that enumeration balances its own stack. Without the push they free
@@ -18949,6 +19143,7 @@ void backend_session_reset (hashcat_ctx_t *hashcat_ctx)
     device_param->exec_pos = 0;
 
     memset (device_param->exec_msec, 0, EXEC_CACHE * sizeof (double));
+    memset (device_param->exec_us_prev_shape, 0, sizeof (device_param->exec_us_prev_shape));
 
     device_param->outerloop_msec  = 0;
     device_param->outerloop_pos   = 0;
