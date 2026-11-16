@@ -5375,20 +5375,33 @@ static HC_THREAD_FUNC hashes_group_thread (void *p)
       salt_buf->digests_done   = 0;
       salt_buf->digests_offset = offsets[salt_idx];
 
-      if (hook_salt_size > 0)
-      {
-        memcpy (param->hook_salts_buf_new + ((u64) salt_idx * hook_salt_size), hashes_buf[i].hook_salt, hook_salt_size);
-      }
-
       hashes_buf[i].salt = salt_buf;
-
-      if (hook_salt_size > 0) hashes_buf[i].hook_salt = param->hook_salts_buf_new + ((u64) salt_idx * hook_salt_size);
     }
     else if (hashconfig->is_salted == true)
     {
       hashes_buf[i].salt = &salts_buf_new[salt_idx];
+    }
 
-      if (hook_salt_size > 0) hashes_buf[i].hook_salt = param->hook_salts_buf_new + ((u64) salt_idx * hook_salt_size);
+    if (hook_salt_size > 0)
+    {
+      if (hashconfig->opts_type & OPTS_TYPE_HOOK_SALT_PER_DIGEST)
+      {
+        // the slot stays with the digest, not the salt: digests that share a salt keep
+        // their own hook data
+
+        memcpy (param->hook_salts_buf_new + ((u64) i * hook_salt_size), hashes_buf[i].hook_salt, hook_salt_size);
+
+        hashes_buf[i].hook_salt = param->hook_salts_buf_new + ((u64) i * hook_salt_size);
+      }
+      else
+      {
+        if (i == offsets[salt_idx])
+        {
+          memcpy (param->hook_salts_buf_new + ((u64) salt_idx * hook_salt_size), hashes_buf[i].hook_salt, hook_salt_size);
+        }
+
+        hashes_buf[i].hook_salt = param->hook_salts_buf_new + ((u64) salt_idx * hook_salt_size);
+      }
     }
 
     if (param->digests_buf_new != NULL)
@@ -5949,15 +5962,27 @@ int hashes_init_stage4 (hashcat_ctx_t *hashcat_ctx)
     }
   }
 
-  // test iteration count in association attack
+  // An association attack launches every salt at once, with the loops of the first one. Its kernels
+  // take each work item's own salt, but the host runs every loop and repeat as salt 0 asks, so a hash
+  // with other counts would never crack.
 
   if (user_options->attack_mode == ATTACK_MODE_ASSOCIATION)
   {
-    salt_t *salts_buf = hashes->salts_buf;
+    const salt_t *salts_buf = hashes->salts_buf;
 
     for (u32 salt_idx = 1; salt_idx < hashes->salts_cnt; salt_idx++)
     {
-      if (salts_buf[salt_idx - 1].salt_iter != salts_buf[salt_idx].salt_iter)
+      const salt_t *prev = &salts_buf[salt_idx - 1];
+      const salt_t *salt = &salts_buf[salt_idx];
+
+      bool mixed = false;
+
+      if (prev->salt_iter    != salt->salt_iter)    mixed = true;
+      if (prev->salt_iter2   != salt->salt_iter2)   mixed = true;
+      if (prev->salt_iter3   != salt->salt_iter3)   mixed = true;
+      if (prev->salt_repeats != salt->salt_repeats) mixed = true;
+
+      if (mixed == true)
       {
         event_log_error (hashcat_ctx, "Mixed iteration counts are not supported in association attack-mode.");
 
