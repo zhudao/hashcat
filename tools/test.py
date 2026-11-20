@@ -5313,7 +5313,9 @@ EDGE_SKIP_OUT_MATCH = {14000, 14100, 14300, 22000, 22001, 31500, 31600}
 
 # 35900 reads only as many characters of the Hashids salt as its shuffles take, one fewer than the
 # alphabet holds, so the noise words that differ only past those all produce the same hashid.
-EDGE_VERIFY_OUT = {1500, 35900, 36901, 37902, 37903}
+
+# 37400 stores only one byte of the second DES block for a nine-byte password, so valid cracks can differ.
+EDGE_VERIFY_OUT = {1500, 35900, 36901, 37400, 37902, 37903}
 
 # The modes whose -HH says same-salt is "Not" allowed but that the suite runs with a shared salt
 # anyway (test_edge.sh SKIP_SAME_SALT_HASH_TYPES, the active list).
@@ -6677,7 +6679,7 @@ def bridge_family(mode):
 def bridge_vectors(mode, family, hash_path, word_path):
   # Build bridge-format vectors for a mode from its own oracle, through tools/test_bridge.py, under
   # the given family ("p" or "o"; see bridge_family). Returns the vector count, or -1 when none could
-  # be made: oracle error, or every hash too long for the bridge's 1024 byte salt.
+  # be made: oracle error, or every hash too long for the bridge's 131072 byte salt.
   cmd = [sys.executable, os.path.join(TDIR, "test_bridge.py"), "vectors", str(mode), hash_path, word_path]
 
   if family == "p":
@@ -6724,9 +6726,9 @@ def run_bridge(args):
       n = bridge_vectors(mode, family, hpath, wpath)
 
       if n <= 0:
-        print("%s > Skip : oracle produced no bridge vectors" % label)
-        record("Skip")
-        note_verdict("Skip")
+        print("%s > Error : oracle failed or produced no bridge vectors" % label)
+        record("Error")
+        note_verdict("Error")
 
         continue
 
@@ -6755,8 +6757,8 @@ def run_bridge(args):
 
       detail = f", {c['err']}/{c['cnt']} errors" if c["err"] else ""
 
-      print(f"{label} > {v} : {missing if rc == 0 else 0}/{n} not found, "
-            f"{extra if rc == 0 else 0}/{n} not matched, 0/{n} timeout, 0/{n} skipped{detail}")
+      print(f"{label} > {v} : {missing}/{n} not found, "
+            f"{extra}/{n} not matched, 0/{n} timeout, 0/{n} skipped{detail}")
 
       record(v)
       note_verdict(v)
