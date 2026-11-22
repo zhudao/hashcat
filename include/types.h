@@ -814,6 +814,9 @@ typedef enum opts_type
   // The module supports the separate test-only scrypt N override.
   OPTS_TYPE_SCRYPT_OVERRIDE          = (1ULL << 34),
 
+  // Use a lower hash list size threshold for decoders that do substantial work per record.
+  OPTS_TYPE_HASH_DECODE_EXPENSIVE    = (1ULL << 35),
+
                                                      // like a hook12 kernel but without extra buffers.
                                                      // but unlike a hook kernel this kernel is called for every _loop iteration offset
   OPTS_TYPE_BINARY_HASHFILE          = (1ULL << 45),
@@ -831,7 +834,7 @@ typedef enum opts_type
   OPTS_TYPE_SUGGEST_KG               = (1ULL << 51), // suggest keep guessing for modules the user maybe wants to use --keep-guessing
   OPTS_TYPE_COMBI_PURE_SWAP          = (1ULL << 33), // the _a1-pure.cl kernel assembles the candidate honoring combs_mode (handles BASE_RIGHT), so -a 1 may pick the larger wordlist as the base word source
 
-  // Bits 35 to 43 are free. They held flags that said which kernels a session
+  // Bits 36 to 43 are free. They held flags that said which kernels a session
   // runs, and those are a mask over hc_dev_kern_t now, read through hashconfig_t.kern_bits. A module
   // names the ones it provides in module_kern_bits (), and hashcat turns on _init, _loop and _comp
   // itself for a slow hash, which is what the removed INIT, LOOP and COMP flags did.
@@ -3613,9 +3616,10 @@ typedef struct mask_ctx
 
   // How many candidates this round's mask holds, which is what the mask feed reports as its
   // keyspace. bfs_cnt is the part of the mask the device generates and is not the same number: it
-  // is a suffix of the mask, and under the feed there is no device side at all.
+  // is a suffix of the mask, and under the feed there is no device side at all. It is 128 bits wide
+  // because the mask feed is -a 3 given rules, and -a 3 takes a mask past 2^64.
 
-  u64    feed_keyspace;
+  u128   feed_keyspace;
 
   // How many consecutive right words share the low bytes of w0, which is what a mode's run kernels
   // hoist work on: the product of the charset sizes of the right positions above those bytes, and
