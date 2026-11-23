@@ -694,6 +694,16 @@ static char *status_get_guess_feed (const hashcat_ctx_t *hashcat_ctx)
     return guess_base;
   }
 
+  // The mask feed is named by the mask its round is walking. global_init () runs before the first round
+  // has picked one, and --increment or a mask file moves on to another mask every round.
+
+  if (mask_feed_kind (hashcat_ctx->user_options) == MASK_FEED_MASK)
+  {
+    const mask_ctx_t *mask_ctx = hashcat_ctx->mask_ctx;
+
+    if (mask_ctx->mask != NULL) return strdup (mask_ctx->mask);
+  }
+
   // a feed that named itself during global_init () gets to say what it is generating from. One
   // that did not is named by the plugin the user asked for.
 
@@ -807,6 +817,15 @@ int status_get_guess_base_offset (const hashcat_ctx_t *hashcat_ctx)
 
   if (user_options_extra->base_source == BASE_SOURCE_FEED)
   {
+    // The mask feed runs a round per mask, the way -a 3 does, so the queue is the queue of masks.
+
+    if (mask_feed_kind (user_options) == MASK_FEED_MASK)
+    {
+      const mask_ctx_t *mask_ctx = hashcat_ctx->mask_ctx;
+
+      return mask_ctx->masks_pos + 1;
+    }
+
     // A feed handed every source at once is one entry in the queue, and it says where inside itself the
     // run has reached with its own segments instead. A feed scoped to one source per round is a real
     // queue of rounds, and the round is the position in it, so those fall through to the answer below.
@@ -855,6 +874,13 @@ int status_get_guess_base_count (const hashcat_ctx_t *hashcat_ctx)
 
   if (user_options_extra->base_source == BASE_SOURCE_FEED)
   {
+    if (mask_feed_kind (user_options) == MASK_FEED_MASK)
+    {
+      const mask_ctx_t *mask_ctx = hashcat_ctx->mask_ctx;
+
+      return mask_ctx->masks_cnt;
+    }
+
     // A feed handed every source at once is one entry in the queue, and it says where inside itself the
     // run has reached with its own segments instead. A feed scoped to one source per round is a real
     // queue of rounds, and the round is the position in it, so those fall through to the answer below.
@@ -2367,7 +2393,8 @@ double status_get_hashes_msec_dev_benchmark (const hashcat_ctx_t *hashcat_ctx, c
     // The fastest launches stand for the device when every launch does the same work, as with the one
     // hash of the benchmark. The salts of a list take turns in the speed ring and can cost different
     // amounts, so there the fastest launches are only the cheapest salts, and every launch counts. A
-    // device that tests every salt in one launch does the same work in each of them.
+    // device that tests many salts in one launch runs every launch at the same rate, whatever the size
+    // of its group of salts.
 
     const bool salts_take_turns = (salts_in_turn (hashcat_ctx) > 1) && (device_param->salt_sweep == false);
 
@@ -3391,9 +3418,19 @@ int status_get_brain_link_client_id_dev (const hashcat_ctx_t *hashcat_ctx, const
 
   int brain_client_id = -1;
 
+  // A device holds one link per pipeline slot and the display has room for one id, so it names the
+  // first link that is up. Which is also what the status beside it answers about.
+
   if ((device_param->skipped == false) && (device_param->skipped_warning == false))
   {
-    brain_client_id = device_param->brain_link_client_fd;
+    for (int slot_pos = 0; slot_pos < PW_PIPE_SLOTS; slot_pos++)
+    {
+      if (device_param->brain_link[slot_pos].client_fd == -1) continue;
+
+      brain_client_id = device_param->brain_link[slot_pos].client_fd;
+
+      break;
+    }
   }
 
   return brain_client_id;
@@ -3409,7 +3446,18 @@ int status_get_brain_link_status_dev (const hashcat_ctx_t *hashcat_ctx, const in
 
   if ((device_param->skipped == false) && (device_param->skipped_warning == false))
   {
-    if (device_param->brain_link_client_fd   != -1)   brain_link_status_dev = BRAIN_LINK_STATUS_CONNECTED;
+    // Connected while any slot has a link. A slot whose link dropped retries it on its next batch,
+    // and a slot an attack never uses never opens one, so neither is the device losing the brain.
+
+    for (int slot_pos = 0; slot_pos < PW_PIPE_SLOTS; slot_pos++)
+    {
+      if (device_param->brain_link[slot_pos].client_fd == -1) continue;
+
+      brain_link_status_dev = BRAIN_LINK_STATUS_CONNECTED;
+
+      break;
+    }
+
     if (device_param->brain_link_recv_active == true) brain_link_status_dev = BRAIN_LINK_STATUS_RECEIVING;
     if (device_param->brain_link_send_active == true) brain_link_status_dev = BRAIN_LINK_STATUS_SENDING;
   }
@@ -4127,8 +4175,13 @@ int status_ctx_init (hashcat_ctx_t *hashcat_ctx)
 
   hc_thread_mutex_init (status_ctx->mux_dispatcher);
   hc_thread_mutex_init (status_ctx->mux_counter);
-  hc_thread_mutex_init (status_ctx->mux_display);
   hc_thread_mutex_init (status_ctx->mux_hwmon);
+
+  // The event callback runs with mux_display held, for a crack and for a status refresh, and a
+  // program that embeds the library may pause or resume from it. hashcat_session_pause () and
+  // hashcat_session_resume () take mux_display as well, so the same thread locks it a second time.
+
+  hc_thread_mutex_init_recursive (status_ctx->mux_display);
 
   return 0;
 }

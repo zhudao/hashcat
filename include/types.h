@@ -1367,6 +1367,20 @@ typedef enum brain_link_status
   BRAIN_LINK_STATUS_SENDING     = 1 << 2,
 
 } brain_link_status_t;
+
+// One connection to the brain server, held by one pipeline slot. The talking about the next batch
+// happens while the current one is still being launched, and the two cannot share a socket: the
+// protocol is a bare sequence of requests and replies with nothing to tell two of them apart.
+//
+// A commit is also client wide on the server. It promotes everything that connection has reserved
+// and looked up, so two slots on one connection would have the batch that has not run yet recorded
+// as tried by the batch that has.
+
+typedef struct brain_link
+{
+  int client_fd;
+
+} brain_link_t;
 #endif
 
 #ifdef _WIN
@@ -1655,9 +1669,8 @@ typedef struct pw_pre
 // Where a batch goes on from another position than the one it reached. A refill usually picks up
 // where the batch left off, but the brain skips the part of a chunk another client has already
 // covered, and with several devices the positions in between may have gone to another device. A
-// crack is named by the position its candidate came from, so the batch keeps each such place.
-
-#define PW_RUNS_MAX 32
+// rejected word keeps its position but adds no candidate, so the candidate after it starts a run as
+// well. A crack is named by the position its candidate came from, so the batch keeps each such place.
 
 typedef struct pw_run
 {
@@ -1666,11 +1679,31 @@ typedef struct pw_run
 
 } pw_run_t;
 
+// A batch can need a run for every candidate that follows a rejected word, so the table grows with the
+// batch instead of having a fixed size. It is allocated with the first run, so an attack without
+// rejects or gaps never holds one.
+
+typedef struct pw_runs
+{
+  pw_run_t *buf;
+  u32       cnt;
+  u32       max;
+
+} pw_runs_t;
+
 typedef struct pw_batch
 {
   pw_idx_t *pws_idx;
   u32      *pws_comp;
   u64       pws_cnt;
+
+  // The brain connection this slot talks over, see brain_link_t. The lookup buffers did not follow
+  // it in: there is one producer thread, so only one lookup is ever in flight and the one set the
+  // device holds is enough. A second producer would need them per slot as well.
+
+  #ifdef WITH_BRAIN
+  brain_link_t *brain_link;
+  #endif
 
   // The device engine's cells, one per candidate in this batch. They belong to the batch for the same
   // reason the candidates do: the next batch is built while this one runs.
@@ -1704,8 +1737,7 @@ typedef struct pw_batch
   u128 words_fin;
   u64  words_extra;
 
-  pw_run_t runs_buf[PW_RUNS_MAX];
-  u32      runs_cnt;
+  pw_runs_t runs;
 
   // A rejected word of a feed that amplifies cost a whole cell rather than one candidate, and this
   // holds what those cells came to, in candidates. The cell itself does not survive the rejection,
@@ -2091,7 +2123,11 @@ typedef struct hc_device_param
   u64  size_brain_link_in;
   u64  size_brain_link_out;
 
-  int           brain_link_client_fd;
+  // One per pipeline slot, each pointed to by that slot. What follows stays per device: the status
+  // screen reports a device and not a slot, and one brain outage is one message however many links
+  // it took down.
+
+  brain_link_t  brain_link[PW_PIPE_SLOTS];
   bool          brain_link_reported;    // a failed link is retried per batch, so report an outage once
   link_speed_t  brain_link_recv_speed;
   link_speed_t  brain_link_send_speed;
@@ -2215,7 +2251,7 @@ typedef struct hc_device_param
   float   exec_us_last[HC_DEV_KERN_CNT];
   u32     exec_loops_last[HC_DEV_KERN_CNT];
 
-  // the kernels test every salt of the list in one launch, see module_salt_sweep ()
+  // the kernels test many salts of the list in one launch, see module_salt_sweep ()
 
   bool    salt_sweep;
 
@@ -2228,6 +2264,14 @@ typedef struct hc_device_param
   // count the attack runs with
 
   u32     sweep_live_cnt;
+
+  // how many live salts one sweep launch tests: the group autotune tuned the launch for, the group the
+  // launches so far have room for, and the work of the launch that count was sized on, see
+  // salt_sweep_group ()
+
+  u32     sweep_group_tuned;
+  u32     sweep_group_cnt;
+  u64     sweep_group_work;
 
   // a launch predicted from its salt, see launch_salt_t, and the launch size the records of each kind of
   // chunk were taken at, in work items and in amplifier items per work item
@@ -4896,6 +4940,11 @@ typedef struct hook_thread_param
 
   bool salt_per_pw;
   u64  pws_pos;
+
+  // The candidates the thread passed over because the run was stopping, which keep whatever their
+  // hook entries held before.
+
+  u64  skipped;
 
 } hook_thread_param_t;
 
