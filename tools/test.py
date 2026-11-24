@@ -754,6 +754,9 @@ def child_flags(args, devices=True):
   if args.runtime:
     flags += ["--runtime", str(args.runtime)]
 
+  if args.kernel_accel:
+    flags += ["--kernel-accel", str(args.kernel_accel)]
+
   if args.keep_tmp:
     flags.append("--keep-tmp")
 
@@ -776,9 +779,10 @@ def apply_run_options(args):
 
   KEEP_TMP = args.keep_tmp
 
-  for name, seconds in (("--runtime", args.runtime),
-                        ("--metal-compiler-runtime", args.metal_compiler_runtime)):
-    if seconds is not None and seconds <= 0:
+  for name, value in (("--runtime", args.runtime),
+                      ("--kernel-accel", args.kernel_accel),
+                      ("--metal-compiler-runtime", args.metal_compiler_runtime)):
+    if value is not None and value <= 0:
       die("! %s must be greater than 0" % name)
 
   # One invocation runs one path, so --runtime sets whichever of the three caps that path reads.
@@ -1313,10 +1317,33 @@ def verdict(c):
   return "OK"
 
 
+def iteration_kernel_opts(mode, opts, generated=True):
+  # Bound warmup batches for reduced generated vectors while preserving explicit tuning.
+  accel = test_iterations.iteration_kernel_accel(mode) if generated else None
+
+  if accel is None:
+    return []
+
+  for option in opts:
+    option = os.fsdecode(option)
+
+    if option.split("=", 1)[0] in ("--kernel-accel", "-n") or (option.startswith("-n") and option[2:].isdigit()):
+      return []
+
+  flags = ["--kernel-accel", str(accel)]
+
+  if "--force" not in opts and b"--force" not in opts:
+    flags.append("--force")
+
+  return flags
+
+
 def run_hashcat(opts, mode, target, stdin_bytes, attack=0, extra=(), generated_hash=True):
   global LAST_CMD, LAST_STDIN, LAST_ENV, CAPPED_MEM_SKIP
 
   cmd = [BIN] + with_bridge_opts(opts, mode) + module_opts(mode) + ["-a", str(attack), "-m", str(mode), target] + list(extra)
+  tuning_opts = list(opts) + module_opts(mode) + list(extra)
+  cmd += iteration_kernel_opts(mode, tuning_opts, generated_hash)
   LAST_CMD = cmd
   LAST_STDIN = stdin_bytes
 
@@ -2343,11 +2370,11 @@ def multi_len_params(mode, attack=None):
 
   if mode == 2500:
     min_len = 7
-  elif mode in (14000, 14100, 14300, 14900, 15400):
+  elif mode in (14000, 14100, 14300, 14900, 15400, 47000):
     # The oracle makes one password length only, so every slot is pinned to it, or the hybrid multi
     # runs feed hashcat an empty hash file. The split keeps the masked part to a few bytes: the tail
     # for -a 6 and the head for -a 7.
-    fixed_len = {14000: 8, 14100: 24, 14300: 16, 14900: 10, 15400: 32}[mode]
+    fixed_len = {14000: 8, 14100: 24, 14300: 16, 14900: 10, 15400: 32, 47000: 16}[mode]
     min_len   = 3 if attack == 7 else fixed_len - 5
   elif mode == 16800:
     min_len = 7
@@ -3584,6 +3611,12 @@ def container_veracrypt(args, mode, width, tmp):
   # options. Invalid hash+cipher pairs have no file and are skipped, as test.sh does.
   opts = base_opts(args)
 
+  mask = CONTAINER_MASK_MID
+
+  if args.generate:
+    _, password = veracrypt_generation_parameters()
+    mask = container_mask_from_password(password, "first")
+
   s = "%05d" % mode
   hfun = VC_HASH_DIGIT.get(int(s[3]))
 
@@ -3629,7 +3662,7 @@ def container_veracrypt(args, mode, width, tmp):
         continue
 
     container_crack(args, opts + pim_opts, mode, 3, hash_arg, width, "Cipher %s" % cascade,
-                    [CONTAINER_MASK_MID], report_attack=0)
+                    [mask], report_attack=0)
 
 
 # test.sh cryptoloop_test (test.sh): 145HC, H the hash digit and C the cipher digit; every mode is
@@ -3902,6 +3935,17 @@ def vc_encryption_name(cascade):
   return "-".join(parts)
 
 
+def veracrypt_generation_parameters():
+  password = CONTAINER_PASSWORD.decode("utf-8")
+  pim = 1 if test_iterations.iteration_reduction_requested() else 0
+
+  if pim == 1:
+    # VeraCrypt permits PIM 1 only with passwords of at least 20 characters.
+    password = password.ljust(20, "0")
+
+  return pim, password.encode("utf-8")
+
+
 def veracrypt_generate(mode, vc_hash, cascade, out_file):
   # test.sh veracrypt_generate: build the volume with the veracrypt console binary, as the user. 1.26
   # dropped RIPEMD-160 for new volumes, so those need VERACRYPT_BIN pointed at a 1.25.9 or older build.
@@ -3920,11 +3964,16 @@ def veracrypt_generate(mode, vc_hash, cascade, out_file):
   if os.path.exists(out_file):
     os.remove(out_file)
 
+  pim, password = veracrypt_generation_parameters()
+
+  if pim > 0:
+    print("[ test.py ] [ Type %d ] > Generated VeraCrypt cost: PIM=%d" % (mode, pim))
+
   # 1 MiB is over VeraCrypt's minimum and keeps generation to a moment; hashcat only reads the header.
   gen_run([vbin, "--text", "--create", out_file, "--size=1M",
-           "--password=%s" % CONTAINER_PASSWORD.decode("utf-8"), "--volume-type=normal",
+           "--password=%s" % password.decode("utf-8"), "--volume-type=normal",
            "--encryption=%s" % encryption, "--hash=%s" % vc_hash, "--filesystem=none",
-           "--pim=0", "--keyfiles=", "--random-source=/dev/urandom", "--non-interactive"])
+           "--pim=%d" % pim, "--keyfiles=", "--random-source=/dev/urandom", "--non-interactive"])
 
   if not os.path.exists(out_file) or os.path.getsize(out_file) == 0:
     if os.path.exists(out_file):
@@ -4075,9 +4124,12 @@ def luks1_generate(mode, luks_hash, luks_cipher, lmode, ksize, out_file):
   return True
 
 
+def luks2_generation_memory():
+  return 32 if test_iterations.iteration_reduction_requested() else 16384
+
+
 def luks2_generate(mode, lmode, ksize, out_file):
-  # test.sh luks2_generate: the smallest argon2id 34100 is still itself at (t=4, m=16 MiB, p=1), the
-  # shape of the container hashcat.net ships. Opening and formatting the payload needs root, as LUKS1.
+  # Opening and formatting the payload needs root, as LUKS1.
   cryptsetup = _tool("CRYPTSETUP_BIN", "cryptsetup")
 
   if not _have(cryptsetup):
@@ -4094,10 +4146,14 @@ def luks2_generate(mode, lmode, ksize, out_file):
   with open(out_file, "wb") as fh:
     fh.truncate(48 * 1024 * 1024)
 
+  memory = luks2_generation_memory()
+
+  print("[ test.py ] [ Type %d ] > Generated LUKS2 cost: t=4, m=%d KiB, p=1" % (mode, memory))
+
   rc, _ = gen_run([cryptsetup, "luksFormat", "--batch-mode", "--type", "luks2",
                    "--cipher", "aes-%s" % chain, "--key-size", ksize, "--hash", "sha256",
                    "--pbkdf", "argon2id", "--pbkdf-force-iterations", "4",
-                   "--pbkdf-memory", "16384", "--pbkdf-parallel", "1", out_file],
+                   "--pbkdf-memory", str(memory), "--pbkdf-parallel", "1", out_file],
                   stdin=CONTAINER_PASSWORD + b"\n", sudo=True)
 
   if rc != 0:
@@ -4130,7 +4186,8 @@ def generate_containers(args, mode, tmp):
     os.makedirs(LUKS2_TESTS_DIR, exist_ok=True)
 
     for lmode, ksize in luks_variants():
-      out = os.path.join(LUKS2_TESTS_DIR, "luks2-aes-argon2id-t4-m16-p1-%s-%s.img" % (lmode, ksize))
+      memory = "32KiB" if test_iterations.iteration_reduction_requested() else "16"
+      out = os.path.join(LUKS2_TESTS_DIR, "luks2-aes-argon2id-t4-m%s-p1-%s-%s.img" % (memory, lmode, ksize))
 
       if not os.path.exists(out):
         luks2_generate(mode, lmode, ksize, out)
@@ -4192,7 +4249,9 @@ def generate_containers(args, mode, tmp):
       return
 
     for cascade in VC_CASCADES.get(int(s[4]), {}).values():
-      out = os.path.join(VC_TESTS_DIR, "hashcat_%s_%s.vc" % (hfun, cascade))
+      pim, _ = veracrypt_generation_parameters()
+      suffix = "_pim%d" % pim if pim > 0 else ""
+      out = os.path.join(VC_TESTS_DIR, "hashcat_%s_%s%s.vc" % (hfun, cascade, suffix))
 
       if not os.path.exists(out):
         veracrypt_generate(mode, hfun, cascade, out)
@@ -4929,6 +4988,9 @@ def selftest_opts(args):
 
   opts += ["--runtime", str(SELFTEST_RUNTIME), "-D", args.device]
 
+  if args.kernel_accel:
+    opts += ["--kernel-accel", str(args.kernel_accel)]
+
   if args.backend_devices:
     opts += ["--backend-devices", args.backend_devices]
 
@@ -5219,6 +5281,9 @@ def base_opts(args):
 
   opts += ["--runtime", str(RUNTIME), "-D", args.device]
 
+  if args.kernel_accel:
+    opts += ["--kernel-accel", str(args.kernel_accel)]
+
   # -d pins the run to those backend devices: the ones the user named, or the single card the depth -j
   # split gives each worker. -D stays as the type, which a pinned device already is.
   if args.backend_devices:
@@ -5350,6 +5415,7 @@ def edge_run(opts, mode, target, stdin_bytes, attack, extra):
   argv += [b"-a", str(attack).encode("ascii"), b"-m", str(mode).encode("ascii")]
   argv += [edge_as_bytes(target)]
   argv += [edge_as_bytes(x) for x in extra]
+  argv += [edge_as_bytes(x) for x in iteration_kernel_opts(mode, argv[1:])]
 
   LAST_CMD = argv
   LAST_STDIN = stdin_bytes
@@ -5357,7 +5423,7 @@ def edge_run(opts, mode, target, stdin_bytes, attack, extra):
   env = test_iterations.iteration_environment(mode)
   LAST_ENV = env
 
-  # Preserve the input hash because runtime overrides can change its encoded iteration count.
+  # Preserve generated hash forms that the mode encoder cannot reproduce.
   if test_iterations.iteration_copy_hash(mode) and b"--hash-copy" not in argv:
     argv.append(b"--hash-copy")
 
@@ -6276,6 +6342,9 @@ def edge_opts(args, optimized, width, pt_hex, outfile):
   opts += ISOLATION
   opts += ["-D", args.device, "--runtime", str(EDGE_RUNTIME), "--self-test-disable"]
 
+  if args.kernel_accel:
+    opts += ["--kernel-accel", str(args.kernel_accel)]
+
   if args.backend_devices:
     opts += ["--backend-devices", args.backend_devices]
 
@@ -6848,6 +6917,8 @@ def main():
   ap.add_argument("--runtime", dest="runtime", type=int, default=None,
                   help="hashcat --runtime in seconds for whichever path runs "
                        "(defaults: %d self-test, %d full, %d edge)" % (SELFTEST_RUNTIME, RUNTIME, EDGE_RUNTIME))
+  ap.add_argument("--kernel-accel", dest="kernel_accel", type=int, default=None,
+                  help="hashcat kernel acceleration factor (requires -f)")
   ap.add_argument("-d", dest="backend_devices", default=None,
                   help="hashcat --backend-devices: 1 | 1,2 | ... (default: every device of the -D type)")
   # -O is accepted and does nothing, as in test.sh where optimized is already the default; -P is
@@ -6860,7 +6931,7 @@ def main():
   ap.add_argument("-V", dest="vector", default="default", help="1 | 4 | default (both)")
   iterations = ap.add_mutually_exclusive_group()
   iterations.add_argument("--artificially-low-iteration-count", action="store_true", default=None,
-                          help="generate supported test hashes with 2 iterations (default)")
+                          help="generate supported test hashes with reduced costs (default)")
   iterations.add_argument("--full-iteration-count", dest="artificially_low_iteration_count", action="store_false",
                           help="use original iteration counts instead of reduced counts")
   ap.add_argument("-S", dest="selftest_all", action="store_true",

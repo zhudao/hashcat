@@ -426,6 +426,7 @@ typedef enum attack_mode
   ATTACK_MODE_HYBRID2     = 7,
   ATTACK_MODE_GENERIC     = 8,
   ATTACK_MODE_ASSOCIATION = 9,
+  ATTACK_MODE_PRINCE      = 10,
   ATTACK_MODE_HYBRID      = 12,
   ATTACK_MODE_NONE        = 100
 
@@ -3300,6 +3301,7 @@ typedef struct user_options
   const char  *rule_buf_l;
   const char  *rule_buf_r;
   const char  *session;
+  char        *session_alloc;
   char        *encrypt_with_pubkey;
   u32          attack_mode;
 
