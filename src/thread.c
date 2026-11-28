@@ -671,7 +671,8 @@ static bool bypass_to_next_source (hashcat_ctx_t *hashcat_ctx)
 
   hc_thread_mutex_unlock (status_ctx->mux_dispatcher);
 
-  // The segment table counts lines, and under --slow-candidates a run position counts candidates.
+  // The segment table counts the feed's own positions, and a run position can count more than that:
+  // every candidate under --slow-candidates, every mask value under the hybrid feed.
 
   const u128 words_off = status_get_base_word (hashcat_ctx, run_off);
 
@@ -705,6 +706,10 @@ static bool bypass_to_next_source (hashcat_ctx_t *hashcat_ctx)
 int bypass (hashcat_ctx_t *hashcat_ctx)
 {
   status_ctx_t *status_ctx = hashcat_ctx->status_ctx;
+
+  // a session that has cracked every hash is already ending, and the bypass would overwrite that
+
+  if (status_ctx->devices_status == STATUS_CRACKED) return -1;
 
   if (bypass_to_next_source (hashcat_ctx) == true) return 0;
 
